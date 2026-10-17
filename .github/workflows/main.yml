@@ -18,13 +18,11 @@ jobs:
         run: |
           echo "=== Disk before cleanup ==="
           df -h /
-
           sudo rm -rf /usr/share/dotnet
           sudo rm -rf /usr/local/lib/android
           sudo rm -rf /opt/ghc
           sudo rm -rf /usr/local/share/boost
           sudo rm -rf "$AGENT_TOOLSDIRECTORY"
-
           echo "=== Disk after cleanup ==="
           df -h /
 
@@ -71,13 +69,14 @@ jobs:
         run: |
           if gh release view "${{ steps.build.outputs.tag }}" > /dev/null 2>&1; then
             echo "exists=true" >> $GITHUB_OUTPUT
-            echo "Release already exists → skip"
+            echo "Release already exists, skipping"
           else
             echo "exists=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Download all files
+      - name: Download and verify all files
         if: steps.check.outputs.exists == 'false'
+        id: verify
         run: |
           mkdir -p download
           cd download
@@ -95,41 +94,62 @@ jobs:
             "build-manifest.xml"
           )
 
+          echo "=== Fetching official SHA256 from mirrorbits ==="
+          > OFFICIAL.sha256
+
           for f in "${FILES[@]}"; do
-            echo "↓ Downloading $f ..."
+            echo -n "  $f ... "
+            HASH_LINE=$(curl -sL --retry 5 "$BASE/$f?sha256")
+            HASH=$(echo "$HASH_LINE" | awk '{print $1}')
+
+            if [[ ! "$HASH" =~ ^[a-f0-9]{64}$ ]]; then
+              echo "FAILED (invalid response: $HASH_LINE)"
+              exit 1
+            fi
+
+            echo "$HASH  $f" >> OFFICIAL.sha256
+            echo "$HASH"
+          done
+
+          echo ""
+          cat OFFICIAL.sha256
+          echo ""
+
+          for f in "${FILES[@]}"; do
+            echo "Downloading $f ..."
             curl -fL --retry 8 --retry-delay 15 -C - -o "$f" "$BASE/$f"
           done
 
           echo ""
           ls -lh
+          echo ""
 
-      - name: Verify SHA256 of the zip
-        if: steps.check.outputs.exists == 'false'
-        run: |
-          cd download
-          ZIP="${{ steps.build.outputs.filename }}"
-          EXPECTED="${{ steps.build.outputs.expected_sha256 }}"
+          echo "=== Calculating local SHA256 ==="
+          sha256sum "${FILES[@]}" > LOCAL.sha256
+          cat LOCAL.sha256
+          echo ""
 
-          echo "Calculating SHA256 of $ZIP ..."
-          ACTUAL=$(sha256sum "$ZIP" | awk '{print $1}')
-
-          echo "Expected: $EXPECTED"
-          echo "Actual:   $ACTUAL"
-
-          if [ "$ACTUAL" != "$EXPECTED" ]; then
-            echo "::error::SHA256 mismatch! File is corrupted or wrong."
+          echo "=== Verifying against official hashes ==="
+          if sha256sum -c OFFICIAL.sha256; then
+            echo "All files match official hashes from LineageOS"
+          else
+            echo "::error::SHA256 mismatch"
             exit 1
           fi
 
-          echo "✅ SHA256 of zip matches official hash from LineageOS"
+          cp OFFICIAL.sha256 SHA256SUMS
 
-      - name: Generate SHA256SUMS for all files
-        if: steps.check.outputs.exists == 'false'
-        run: |
-          cd download
-          sha256sum * > SHA256SUMS
-          echo "=== SHA256SUMS ==="
-          cat SHA256SUMS
+          {
+            echo "### Official SHA256 (from LineageOS mirrorbits)"
+            echo '```'
+            cat OFFICIAL.sha256
+            echo '```'
+            echo ""
+            echo "### Local SHA256 (calculated after download)"
+            echo '```'
+            cat LOCAL.sha256
+            echo '```'
+          } > ../checksums.md
 
       - name: Create GitHub Release
         if: steps.check.outputs.exists == 'false'
@@ -139,31 +159,29 @@ jobs:
           TAG="${{ steps.build.outputs.tag }}"
           VERSION="${{ steps.build.outputs.version }}"
           DATE="${{ steps.build.outputs.date }}"
-          SHA="${{ steps.build.outputs.expected_sha256 }}"
 
-          gh release create "$TAG" \
-            --title "LineageOS ${VERSION} (${DATE})" \
-            --notes "$(cat <<EOF
+          NOTES=$(cat <<EOF
           Official LineageOS **${VERSION}** nightly for **rosemary** (${DATE})
 
-          ### Official SHA256 (from LineageOS API)
-          \`\`\`
-          ${SHA}
-          \`\`\`
+          $(cat checksums.md)
 
           ### Files
-          - \`${{ steps.build.outputs.filename }}\` (1.09 GiB)
+          - \`${{ steps.build.outputs.filename }}\`
           - \`boot.img\`
           - \`dtbo.img\`
           - \`lk.img\`
           - \`super_empty.img\`
           - \`vbmeta.img\`
           - \`build-manifest.xml\`
-          - \`SHA256SUMS\` (checksums of all files)
+          - \`SHA256SUMS\`
 
           Source: https://download.lineageos.org/devices/rosemary/builds
           EOF
-          )" \
+          )
+
+          gh release create "$TAG" \
+            --title "LineageOS ${VERSION} (${DATE})" \
+            --notes "$NOTES" \
             ./download/*
 
       - name: Keep only latest 2 releases
@@ -180,5 +198,5 @@ jobs:
               gh release delete "${RELEASES[$i]}" --yes --cleanup-tag
             done
           else
-            echo "≤ 2 releases — nothing to delete"
+            echo "2 or fewer releases, nothing to delete"
           fi
