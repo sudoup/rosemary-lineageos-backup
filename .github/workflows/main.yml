@@ -39,22 +39,17 @@ jobs:
           echo "expected_sha256=$EXPECTED_SHA256" >> $GITHUB_OUTPUT
           echo "size=$SIZE"                       >> $GITHUB_OUTPUT
 
-          echo "=== Latest build ==="
-          echo "File:     $FILENAME"
-          echo "Version:  $VERSION"
-          echo "Date:     $DATE"
-          echo "SHA256:   $EXPECTED_SHA256"
-          echo "Size:     $SIZE bytes"
-          echo "Base URL: $BASE_URL"
+          echo "Latest build: $FILENAME ($TAG)"
 
       - name: Check if release already exists
         id: check
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
         run: |
           if gh release view "${{ steps.build.outputs.tag }}" > /dev/null 2>&1; then
             echo "exists=true" >> $GITHUB_OUTPUT
-            echo "Release ${{ steps.build.outputs.tag }} already exists — no changes, skipping download"
+            echo "No new build — release ${{ steps.build.outputs.tag }} already exists"
           else
             echo "exists=false" >> $GITHUB_OUTPUT
             echo "New build found: ${{ steps.build.outputs.tag }}"
