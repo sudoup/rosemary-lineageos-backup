@@ -1,0 +1,184 @@
+name: Download LineageOS rosemary builds
+
+on:
+  schedule:
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  download-and-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Free disk space
+        run: |
+          echo "=== Disk before cleanup ==="
+          df -h /
+
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+
+          echo "=== Disk after cleanup ==="
+          df -h /
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get latest build info
+        id: build
+        run: |
+          API="https://download.lineageos.org/api/v1/rosemary/nightly/1"
+          curl -sL "$API" -o builds.json
+
+          FILENAME=$(jq -r '.response[0].filename' builds.json)
+          URL=$(jq -r '.response[0].url' builds.json)
+          VERSION=$(jq -r '.response[0].version' builds.json)
+          EXPECTED_SHA256=$(jq -r '.response[0].id' builds.json)
+          SIZE=$(jq -r '.response[0].size' builds.json)
+
+          DATE=$(echo "$FILENAME" | grep -oP '\d{8}')
+          BASE_URL=$(dirname "$URL")
+          TAG="lineage-${VERSION}-${DATE}"
+
+          echo "filename=$FILENAME"               >> $GITHUB_OUTPUT
+          echo "url=$URL"                         >> $GITHUB_OUTPUT
+          echo "version=$VERSION"                 >> $GITHUB_OUTPUT
+          echo "date=$DATE"                       >> $GITHUB_OUTPUT
+          echo "base_url=$BASE_URL"               >> $GITHUB_OUTPUT
+          echo "tag=$TAG"                         >> $GITHUB_OUTPUT
+          echo "expected_sha256=$EXPECTED_SHA256" >> $GITHUB_OUTPUT
+          echo "size=$SIZE"                       >> $GITHUB_OUTPUT
+
+          echo "=== Latest build ==="
+          echo "File:     $FILENAME"
+          echo "Version:  $VERSION"
+          echo "Date:     $DATE"
+          echo "SHA256:   $EXPECTED_SHA256"
+          echo "Size:     $SIZE bytes"
+          echo "Base URL: $BASE_URL"
+
+      - name: Check if release already exists
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "${{ steps.build.outputs.tag }}" > /dev/null 2>&1; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "Release already exists → skip"
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Download all files
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          mkdir -p download
+          cd download
+
+          BASE="${{ steps.build.outputs.base_url }}"
+          ZIP="${{ steps.build.outputs.filename }}"
+
+          FILES=(
+            "$ZIP"
+            "boot.img"
+            "dtbo.img"
+            "lk.img"
+            "super_empty.img"
+            "vbmeta.img"
+            "build-manifest.xml"
+          )
+
+          for f in "${FILES[@]}"; do
+            echo "↓ Downloading $f ..."
+            curl -fL --retry 8 --retry-delay 15 -C - -o "$f" "$BASE/$f"
+          done
+
+          echo ""
+          ls -lh
+
+      - name: Verify SHA256 of the zip
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          cd download
+          ZIP="${{ steps.build.outputs.filename }}"
+          EXPECTED="${{ steps.build.outputs.expected_sha256 }}"
+
+          echo "Calculating SHA256 of $ZIP ..."
+          ACTUAL=$(sha256sum "$ZIP" | awk '{print $1}')
+
+          echo "Expected: $EXPECTED"
+          echo "Actual:   $ACTUAL"
+
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "::error::SHA256 mismatch! File is corrupted or wrong."
+            exit 1
+          fi
+
+          echo "✅ SHA256 of zip matches official hash from LineageOS"
+
+      - name: Generate SHA256SUMS for all files
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          cd download
+          sha256sum * > SHA256SUMS
+          echo "=== SHA256SUMS ==="
+          cat SHA256SUMS
+
+      - name: Create GitHub Release
+        if: steps.check.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.build.outputs.tag }}"
+          VERSION="${{ steps.build.outputs.version }}"
+          DATE="${{ steps.build.outputs.date }}"
+          SHA="${{ steps.build.outputs.expected_sha256 }}"
+
+          gh release create "$TAG" \
+            --title "LineageOS ${VERSION} (${DATE})" \
+            --notes "$(cat <<EOF
+          Official LineageOS **${VERSION}** nightly for **rosemary** (${DATE})
+
+          ### Official SHA256 (from LineageOS API)
+          \`\`\`
+          ${SHA}
+          \`\`\`
+
+          ### Files
+          - \`${{ steps.build.outputs.filename }}\` (1.09 GiB)
+          - \`boot.img\`
+          - \`dtbo.img\`
+          - \`lk.img\`
+          - \`super_empty.img\`
+          - \`vbmeta.img\`
+          - \`build-manifest.xml\`
+          - \`SHA256SUMS\` (checksums of all files)
+
+          Source: https://download.lineageos.org/devices/rosemary/builds
+          EOF
+          )" \
+            ./download/*
+
+      - name: Keep only latest 2 releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mapfile -t RELEASES < <(gh release list --limit 50 --json tagName,createdAt --jq 'sort_by(.createdAt) | reverse | .[].tagName')
+
+          echo "Current releases: ${RELEASES[*]}"
+
+          if [ ${#RELEASES[@]} -gt 2 ]; then
+            for ((i=2; i<${#RELEASES[@]}; i++)); do
+              echo "Deleting old release: ${RELEASES[$i]}"
+              gh release delete "${RELEASES[$i]}" --yes --cleanup-tag
+            done
+          else
+            echo "≤ 2 releases — nothing to delete"
+          fi
