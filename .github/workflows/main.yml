@@ -14,21 +14,6 @@ jobs:
     timeout-minutes: 60
 
     steps:
-      - name: Free disk space
-        run: |
-          echo "=== Disk before cleanup ==="
-          df -h /
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /usr/local/share/boost
-          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
-          echo "=== Disk after cleanup ==="
-          df -h /
-
-      - name: Checkout
-        uses: actions/checkout@v4
-
       - name: Get latest build info
         id: build
         run: |
@@ -69,14 +54,31 @@ jobs:
         run: |
           if gh release view "${{ steps.build.outputs.tag }}" > /dev/null 2>&1; then
             echo "exists=true" >> $GITHUB_OUTPUT
-            echo "Release already exists, skipping"
+            echo "Release ${{ steps.build.outputs.tag }} already exists — no changes, skipping download"
           else
             echo "exists=false" >> $GITHUB_OUTPUT
+            echo "New build found: ${{ steps.build.outputs.tag }}"
           fi
+
+      - name: Free disk space
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          echo "=== Disk before cleanup ==="
+          df -h /
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          echo "=== Disk after cleanup ==="
+          df -h /
+
+      - name: Checkout
+        if: steps.check.outputs.exists == 'false'
+        uses: actions/checkout@v4
 
       - name: Download and verify all files
         if: steps.check.outputs.exists == 'false'
-        id: verify
         run: |
           mkdir -p download
           cd download
@@ -185,6 +187,7 @@ jobs:
             ./download/*
 
       - name: Keep only latest 2 releases
+        if: steps.check.outputs.exists == 'false'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
